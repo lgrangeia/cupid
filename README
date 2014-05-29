@@ -1,0 +1,105 @@
+
+
+                                 (
+                         .-'''-..' \ 
+               _______ .'       -   \
+             <<<<<<<< );__   ,,,_)   \ 
+                <<<<<<<<< ) ;C  /     \ 
+                  <<<<<< (.-'-.  )====_)_=======> wpa_supplicant-cupid 
+                    <<<<< \    '''''''   )           && hostapd-cupid
+                    ;  <<<     .......__/
+               .-'''         (         )
+            .-'              ;.       /
+           /  .-'     .     =  .     /
+       _-''\_/         '. .'    .   /
+    .-'  )  ;\          '''.     . /
+   ;   .''''  `.       '    ;     (
+   O -'        .'''       .'
+             .'   .-'''''`
+             'o-'
+
+
+
+## Cupid 0.1
+
+## Author: Luis Grangeia 
+## lgrangeia@sysvalue.com
+## twitter.com/lgrangeia
+
+# INTRODUCTION
+
+Cupid is a pair of patches for hostapd-2.1 and wpa_supplicant-2.1 to exploit 
+heartbleed on Wireless networks that use EAP Authentication methods based on 
+TLS (specifically OpenSSL)
+
+Please see presentation slides for a simple introduction to cupid:
+
+http://www.slideshare.net/lgrangeia
+
+
+# COMPILATION
+
+Get wpa_supplicant-2.1 and/or hostapd-2.1, apply the respective patch and 
+compile. I don't recommend doing a "make install" as you'll be replacing
+your systems binaries with non-functional copies (functional only for exploiting
+heartbleed).
+
+# USAGE
+
+Both patches come with a "heartbleed.conf" file that can be used to tweak 
+behaviour. It must be present and placed on the same directory you're running 
+the binary. Refer to the file for details.
+
+--> wpa_supplicant:
+
+Use the included test_wpasupplicant.conf and change the ssid to the network 
+you're wanting to test heartbleed for.
+
+Fire up wireshark or tcpdump on the interface to check for TLS heartbeat 
+requests/responses. I usually do:
+
+# airmon-ng start wlan0
+
+and then monitor the whole thing on the mon0 interface (use filter 'EAP || SSL'
+for a better picture).
+
+fire up wpa_supplicant:
+
+./wpa_supplicant -i wlan0 -dd -c ~/testconfs/test_wpasupplicant.conf
+
+Look at the output of wireshark to see if the network you're attacking is 
+vulnerable.
+
+--> hostapd
+
+Use the included test_hostapd.conf. You may have to set up certificates and an 
+empty eap_user file. I've included these for reference as well.
+
+Fire up wireshark as described above.
+
+Note that you need a wireless adapter supporting host AP mode.
+
+fire up hostapd:
+
+./hostapd -d test_hostapd.conf
+
+Then try to connect to the "bleedingheart" network with your mobile device or
+laptop, and it will try to heartbleed it. You can put any login/password 
+combination.
+
+To see if the patch works just install a vulnerable OpenSSL version and try to
+exploit your local copy of wpa_supplicant or a fresh install of hostapd.
+
+### FUTURE WORK
+ 
+Please let me know if you find vulnerable devices and give me their version and
+if possible a packet dump of the actual attack.
+
+TODO:
+	- Code is still very incomplete, just a PoC
+	- Does not decrypt the heartbeat response if encrypted (not the case if
+	pre-handshake)
+	- Should output the heartbeat responses to a file
+	- Test more devices/networks!
+
+
